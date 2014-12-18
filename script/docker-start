@@ -1,0 +1,155 @@
+#!/bin/bash
+set -eo pipefail
+ARGV=$@
+trap "exit 0" 2 15
+
+# Environment variable defaults
+: ${TLL_APP:=webapp}
+: ${TLL_APP_HOME:="/data/app"}
+: ${RAILS_PORT:=3000}
+: ${TLL_ENV:=development}
+: ${RACK_ENV:=$TLL_ENV}
+: ${RAILS_ENV:=$TLL_ENV}
+export RACK_ENV RAILS_ENV RAILS_PORT
+
+function run_cmd {
+  if test -n "$TLL_BUNDLE_EXEC"; then
+    exec "bundle" "exec" $*
+  else
+    exec $*
+  fi
+}
+
+function create_db {
+  echo "==> Running rake db:create db:schema:load --trace"
+  rake db:create db:schema:load --trace
+}
+
+function do_setup {
+  echo "==> Running DB setup steps: rake db:create && rake db:setup"
+  rake db:create
+  rake db:setup
+
+  # TODO: precompile assets?
+}
+
+function do_migrate {
+  echo "==> Running migrations"
+  rake db:create
+  rake db:migrate
+}
+
+function precompile_assets {
+  echo "==> Precompiling assets"
+  RAILS_ENV=production rake assets:precompile --trace
+}
+
+function run_tests {
+  precompile_assets
+  echo "==> Running Teaspoon"
+  test -x /etc/init.d/xvfb && /etc/init.d/xvfb start
+  export TEASPOON=true
+  rake teaspoon
+  unset TEASPOON
+  echo "==> Running Rspec"
+  spec_files=$(find $TLL_APP_HOME/spec/{controllers,decorators,helpers,lib,mailers,models,services,uploaders,validators,features} -name '*.rb' -print)
+  run_cmd "rspec $spec_files"
+}
+
+function run_rspec {
+  echo "==> Running Rspec on $@"
+  if test -n "$WITH_XVFB"; then
+    run_cmd "xvfb-run rspec $@"
+  else
+    run_cmd "rspec $@"
+  fi
+}
+
+function run_teaspoon {
+  export TEASPOON=true
+  echo "==> Running Teaspoon"
+  run_cmd "rake teaspoon"
+}
+
+function main {
+  case "$1" in
+    'worker' | 'sidekiq')
+      bundle check || bundle install
+      echo "==> Booting Sidekiq"
+      run_cmd "sidekiq"
+      ;;
+    'scheduler' | 'clock')
+      bundle check || bundle install
+      echo "==> Booting Clockwork from $TLL_APP_HOME/lib/clock.rb"
+      run_cmd "clockwork lib/clock.rb"
+      ;;
+    'app' | 'rails')
+      bundle check || bundle install
+      test -n "$TLL_DO_SETUP" && do_setup
+      test -n "$TLL_DO_MIGRATE" && do_migrate
+      if test "$RAILS_ENV" = "production" || test -n "$TLL_PRECOMPILE_ASSETS"; then
+        precompile_assets
+      fi
+      run_cmd "unicorn -p $RAILS_PORT -c $TLL_APP_HOME/config/unicorn.rb --no-default-middleware"
+      ;;
+    'migrate')
+      run_cmd "rake db:migrate"
+      ;;
+    'test')
+      run_tests
+      ;;
+    'rspec')
+      shift
+      test -n "$TLL_DO_SETUP" && create_db
+      test -n "$TLL_PRECOMPILE_ASSETS" && precompile_assets
+      run_rspec "$@"
+      ;;
+    'teaspoon')
+      test -n "$TLL_DO_SETUP" && create_db
+      test -n "$TLL_PRECOMPILE_ASSETS" && precompile_assets
+      run_teaspoon
+      ;;
+    'precompile_assets')
+      precompile_assets
+      ;;
+    'create_db')
+      create_db
+      ;;
+    '')
+      >&2 cat <<EOF
+  USAGE: docker-start [COMMAND]
+  No command specified. Valid commands include:
+
+    * app | rails:       Run the TLL Rails web server
+    * worker | sidekiq:  Run the TLL sidekiq server
+    * scheduler | clock: Run clockwork (cron replacement)
+    * migrate:           Run Rails migrations
+    * rspec:             Run rspec tests
+    * teaspoon:          Run teaspoon tests
+    * test               Run all Rails tests
+EOF
+      exit 1
+      ;;
+    *)
+      run_cmd "$@"
+      ;;
+  esac
+}
+
+echo "+----------------------"
+echo "| Starting TLL apps"
+echo "| Command: $1"
+echo "| Environment: $TLL_ENV"
+echo "+----------------------"
+cd $TLL_APP_HOME
+echo "==> Waiting for source to be copied (Unless local)"
+while test ! -e copy_complete && test -z "$TLL_LOCAL"; do
+  sleep 1
+done
+
+ulimit -n 32768
+[[ "$1" =~ "bash" ]] || {
+  bundle check || bundle install --system --clean
+} 
+main "$@"
+exit 0
